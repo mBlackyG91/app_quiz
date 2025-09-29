@@ -1,118 +1,103 @@
-import { createServer } from "@/lib/supabase-server";
+// src/app/admin/quizzes/page.tsx
 import Link from "next/link";
+import { createServer } from "@/lib/supabase-server";
 
-export default async function AdminQuizzes() {
+// model minim pentru listă
+type QuizRow = {
+  id: string;
+  title: string | null;
+  is_published: boolean;
+  created_at: string;
+};
+
+export default async function AdminQuizzesPage({
+  searchParams,
+}: {
+  searchParams?: { msg?: string | string[] };
+}) {
+  // citim eventualul mesaj (?msg=...)
+  const msg = Array.isArray(searchParams?.msg)
+    ? searchParams?.msg[0]
+    : searchParams?.msg;
+
+  // IMPORTANT: client server-side
+  // (Dacă la tine `createServer()` *nu* e async, elimină `await`.)
   const supabase = await createServer();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) return null;
 
-  const { data: profile } = await supabase
-    .from("profiles")
-    .select("role")
-    .eq("id", user.id)
-    .single();
-
-  if (profile?.role !== "admin") {
-    return <div style={{ padding: 24 }}>Nu ai drepturi de admin.</div>;
-  }
-
-  const { data: quizzes } = await supabase
+  const { data, error } = await supabase
     .from("quizzes")
     .select("id,title,is_published,created_at")
     .order("created_at", { ascending: false });
 
+  const quizzes: QuizRow[] = (data ?? []) as QuizRow[];
+
   return (
-    <div style={{ padding: 24 }}>
-      <div
-        style={{
-          display: "flex",
-          justifyContent: "space-between",
-          alignItems: "center",
-        }}
-      >
-        <h1 style={{ fontSize: 22, fontWeight: 700 }}>Admin — Chestionare</h1>
+    <div className="p-4 max-w-4xl mx-auto">
+      <div className="mb-4 flex items-center justify-between">
+        <h1 className="text-xl font-semibold">Admin — Chestionare</h1>
+
         <Link
           href="/admin/quizzes/new"
-          style={{
-            padding: "8px 12px",
-            background: "#111",
-            color: "#fff",
-            borderRadius: 8,
-          }}
+          className="px-3 py-2 rounded bg-black text-white hover:opacity-90"
         >
           Chestionar nou
         </Link>
       </div>
 
-      <div style={{ display: "grid", gap: 12, marginTop: 16 }}>
-        {(quizzes ?? []).map((q) => (
-          <div
-            key={q.id}
-            style={{
-              border: "1px solid #e5e7eb",
-              borderRadius: 8,
-              padding: 12,
-            }}
-          >
-            <div style={{ fontWeight: 600 }}>{q.title}</div>
-            <div style={{ fontSize: 12, color: "#6b7280" }}>
-              {q.is_published ? "Public" : "Draft"}
-            </div>
+      {/* mesaj (ex: redirect din editor când nu găsește quiz-ul) */}
+      {msg ? (
+        <div className="mb-4 rounded border border-yellow-300 bg-yellow-50 p-2 text-sm text-yellow-800">
+          {msg}
+        </div>
+      ) : null}
+
+      {/* eroare încărcare din DB */}
+      {error ? (
+        <div className="mb-4 rounded border border-red-300 bg-red-50 p-2 text-sm text-red-800">
+          Eroare la încărcarea chestionarelor: {error.message}
+        </div>
+      ) : null}
+
+      {quizzes.length === 0 ? (
+        <div className="text-sm text-gray-500">Nu există chestionare.</div>
+      ) : (
+        <div className="space-y-2">
+          {quizzes.map((q) => (
             <div
-              style={{
-                marginTop: 8,
-                display: "flex",
-                gap: 8,
-                flexWrap: "wrap",
-              }}
+              key={q.id}
+              className="rounded border px-3 py-2 flex items-center justify-between"
             >
-              <Link
-                href={`/admin/quizzes/${q.id}`}
-                style={{
-                  padding: "6px 10px",
-                  border: "1px solid #111",
-                  borderRadius: 8,
-                }}
-              >
-                Editează
-              </Link>
-              <Link
-                href={`/admin/quizzes/${q.id}/submissions`}
-                style={{
-                  padding: "6px 10px",
-                  border: "1px solid #111",
-                  borderRadius: 8,
-                }}
-              >
-                Trimiteri
-              </Link>
-              <Link
-                href={`/quiz/${q.id}`}
-                style={{
-                  padding: "6px 10px",
-                  background: "#111",
-                  color: "#fff",
-                  borderRadius: 8,
-                }}
-              >
-                Vezi
-              </Link>
-              <Link
-                href={`/admin/quizzes/${q.id}/analytics`}
-                style={{
-                  padding: "6px 10px",
-                  border: "1px solid #111",
-                  borderRadius: 8,
-                }}
-              >
-                Analytics
-              </Link>
+              <div>
+                <div className="font-medium">{q.title || "(fără titlu)"}</div>
+                <div className="text-xs text-gray-500">
+                  {q.is_published ? "Public" : "Draft"}
+                </div>
+              </div>
+
+              <div className="flex gap-2">
+                <Link
+                  href={`/admin/quizzes/${q.id}`}
+                  className="px-2 py-1 rounded border"
+                >
+                  Editează
+                </Link>
+                <Link
+                  href={`/quizzes/${q.id}`}
+                  className="px-2 py-1 rounded border"
+                >
+                  Vezi
+                </Link>
+                <Link
+                  href={`/admin/quizzes/${q.id}/analytics`}
+                  className="px-2 py-1 rounded border"
+                >
+                  Analytics
+                </Link>
+              </div>
             </div>
-          </div>
-        ))}
-      </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

@@ -3,6 +3,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { createBrowser } from "@/lib/supabase-browser";
 
+/* ======================== Types ======================== */
+
 type QType = "single" | "multiple" | "text" | "number";
 
 type Question = {
@@ -25,18 +27,18 @@ type OptionRow = {
   id: string;
   question_id: string;
   text: string;
-  value: string | null; // "1" => corect, altfel null
+  value: string | null; // "1" => corect; altfel null
   order: number | null;
 };
 
 type OptionDraft = {
-  id?: string; // lipsă => de inserat
+  id?: string; // prezent => update; absent => insert
   text: string;
-  correct: boolean; // UI boolean; mapăm la value "1"/null
+  correct: boolean; // în DB devine "1"/null
   order: number;
 };
 
-/** Util: transformă OptionRow DB -> OptionDraft UI */
+/* DB -> UI */
 function toDraft(o: OptionRow): OptionDraft {
   return {
     id: o.id,
@@ -45,22 +47,33 @@ function toDraft(o: OptionRow): OptionDraft {
     order: Number(o.order ?? 0),
   };
 }
-/** Util: transformă OptionDraft UI -> row pentru DB */
+
+/* UI -> DB (fără id pentru rândurile noi) */
 function toRow(
   qid: string,
   d: OptionDraft
 ): Omit<OptionRow, "id"> & { id?: string } {
-  return {
-    ...(d.id ? { id: d.id } : {}),
+  const row: Omit<OptionRow, "id"> & { id?: string } = {
     question_id: qid,
     text: d.text.trim(),
     value: d.correct ? "1" : null,
     order: d.order,
   };
+  if (d.id) row.id = d.id;
+  return row;
 }
+
+/* normalizează ordinea: 1,2,3… */
+function normalizeOrders(arr: OptionDraft[]): OptionDraft[] {
+  const sorted = [...arr].sort((a, b) => (a.order || 0) - (b.order || 0));
+  return sorted.map((o, i) => ({ ...o, order: i + 1 }));
+}
+
+/* ===================== Component ======================= */
 
 export default function QuizEditor({ quizId }: { quizId: string }) {
   const supabase = useMemo(() => createBrowser(), []);
+
   const [quiz, setQuiz] = useState<Quiz | null>(null);
   const [questions, setQuestions] = useState<Question[]>([]);
   const [loading, setLoading] = useState(true);
@@ -68,30 +81,29 @@ export default function QuizEditor({ quizId }: { quizId: string }) {
   const [title, setTitle] = useState("");
   const [isPublic, setIsPublic] = useState(false);
 
-  // care card este deschis
+  // card deschis
   const [openId, setOpenId] = useState<string | null>(null);
 
-  // drafts de întrebare (titlu/tip/required)
+  // schițe întrebare (label/qtype/required)
   const [drafts, setDrafts] = useState<Record<string, Partial<Question>>>({});
 
-  // ====== OPTIONS state ======
-  // opțiunile curente în UI, per întrebare
+  // OPTIONS state
   const [optDraftsByQ, setOptDraftsByQ] = useState<
     Record<string, OptionDraft[]>
   >({});
-  // id-urile DB inițiale (ca să știm ce trebuie șters la Save)
   const [initialOptIdsByQ, setInitialOptIdsByQ] = useState<
     Record<string, string[]>
   >({});
-  const [savingOpts, setSavingOpts] = useState<string | null>(null); // qid în lucru
+  const [savingOpts, setSavingOpts] = useState<string | null>(null);
 
+  /* ============ Load quiz + questions + options ============ */
   useEffect(() => {
     let cancelled = false;
 
     (async () => {
       setLoading(true);
 
-      // 1) quiz
+      // Quiz
       const { data: q, error: qErr } = await supabase
         .from("quizzes")
         .select("id,title,description,is_published")
@@ -107,7 +119,7 @@ export default function QuizEditor({ quizId }: { quizId: string }) {
         }
       }
 
-      // 2) questions
+      // Questions
       const { data: qs, error: qsErr } = await supabase
         .from("questions")
         .select("id,quiz_id,label,qtype,required,order")
@@ -119,7 +131,7 @@ export default function QuizEditor({ quizId }: { quizId: string }) {
         const list = qs ?? [];
         setQuestions(list);
 
-        // 3) options pentru toate întrebările (doar dacă avem întrebări)
+        // Options
         if (list.length) {
           const qids = list.map((x) => x.id);
           const { data: opts, error: oErr } = await supabase
@@ -159,6 +171,7 @@ export default function QuizEditor({ quizId }: { quizId: string }) {
     };
   }, [quizId, supabase]);
 
+  /* =================== Quiz header save =================== */
   async function handleSaveQuiz() {
     if (!quiz) return;
     setSaving(true);
@@ -175,6 +188,7 @@ export default function QuizEditor({ quizId }: { quizId: string }) {
     setSaving(false);
   }
 
+  /* =================== Questions helpers ================== */
   function openEditor(q: Question) {
     setOpenId((curr) => (curr === q.id ? null : q.id));
     setDrafts((d) => ({
@@ -201,6 +215,11 @@ export default function QuizEditor({ quizId }: { quizId: string }) {
       required: Boolean(draft.required),
     };
 
+    if (!patch.label) {
+      alert("Titlul întrebării nu poate fi gol.");
+      return;
+    }
+
     const { error } = await supabase
       .from("questions")
       .update(patch)
@@ -210,7 +229,6 @@ export default function QuizEditor({ quizId }: { quizId: string }) {
       return;
     }
 
-    // reflectă în listă
     setQuestions((qs) =>
       qs.map((q) => (q.id === qid ? { ...q, ...patch } : q))
     );
@@ -239,6 +257,7 @@ export default function QuizEditor({ quizId }: { quizId: string }) {
       alert("Eroare la adăugare întrebare: " + error.message);
       return;
     }
+
     if (data) {
       setQuestions((qs) =>
         [...qs, data].sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
@@ -250,7 +269,43 @@ export default function QuizEditor({ quizId }: { quizId: string }) {
     }
   }
 
-  // ===== OPTIONS UI helpers =====
+  async function deleteQuestion(qid: string) {
+    if (!confirm("Sigur ștergi întrebarea? Această acțiune este definitivă.")) {
+      return;
+    }
+
+    // (dacă nu ai FK cascade) – curățăm întâi opțiunile
+    const { error: delOptsErr } = await supabase
+      .from("options")
+      .delete()
+      .eq("question_id", qid);
+    if (delOptsErr) {
+      alert("Eroare la ștergerea opțiunilor: " + delOptsErr.message);
+      return;
+    }
+
+    const { error: delQErr } = await supabase
+      .from("questions")
+      .delete()
+      .eq("id", qid);
+    if (delQErr) {
+      alert("Eroare la ștergerea întrebării: " + delQErr.message);
+      return;
+    }
+
+    setQuestions((qs) => qs.filter((q) => q.id !== qid));
+    setOptDraftsByQ((m) => {
+      const { [qid]: _, ...rest } = m;
+      return rest;
+    });
+    setInitialOptIdsByQ((m) => {
+      const { [qid]: _, ...rest } = m;
+      return rest;
+    });
+    if (openId === qid) setOpenId(null);
+  }
+
+  /* ==================== Options helpers =================== */
   const canHaveOptions = (qtype: QType) =>
     qtype === "single" || qtype === "multiple";
 
@@ -276,55 +331,70 @@ export default function QuizEditor({ quizId }: { quizId: string }) {
     setOptDraftsByQ((m) => {
       const arr = [...(m[qid] ?? [])];
       arr.splice(idx, 1);
-      return { ...m, [qid]: arr };
+      return { ...m, [qid]: normalizeOrders(arr) };
+    });
+  }
+
+  function moveOption(qid: string, idx: number, dir: -1 | 1) {
+    setOptDraftsByQ((m) => {
+      const arr = [...(m[qid] ?? [])];
+      const newIdx = idx + dir;
+      if (newIdx < 0 || newIdx >= arr.length) return m;
+
+      // swap by order + normalize
+      const a = arr[idx];
+      const b = arr[newIdx];
+      const tmp = a.order;
+      a.order = b.order ?? 0;
+      b.order = tmp ?? 0;
+
+      return { ...m, [qid]: normalizeOrders(arr) };
     });
   }
 
   async function saveOptionsForQuestion(qid: string) {
     setSavingOpts(qid);
     try {
-      const arr = optDraftsByQ[qid] ?? [];
-      const initialIds = new Set(initialOptIdsByQ[qid] ?? []);
+      const arrRaw = optDraftsByQ[qid] ?? [];
 
-      // 1) upsert (insert/update)
-      if (arr.length) {
-        const rows = arr.map((d) => toRow(qid, d));
-        const { data, error } = await supabase
-          .from("options")
-          .upsert(rows, { onConflict: "id" }) // dacă are id -> update; fără id -> insert
-          .select("id");
+      // 1) curăț: rânduri cu text gol => se consideră șterse în UI
+      let arr = arrRaw.filter((o) => (o.text ?? "").trim().length > 0);
+      arr = normalizeOrders(arr);
 
-        if (error) {
-          alert("Eroare la salvarea opțiunilor: " + error.message);
+      // reguli în funcție de tip
+      const currentQ = questions.find((x) => x.id === qid);
+      const qtype = (drafts[qid]?.qtype ??
+        currentQ?.qtype ??
+        "single") as QType;
+
+      if (!arr.length) {
+        alert("Adaugă cel puțin o opțiune (cu text) înainte de salvare.");
+        return;
+      }
+      if (qtype === "single") {
+        const cnt = arr.filter((o) => o.correct).length;
+        if (cnt !== 1) {
+          alert("La „single” trebuie exact o opțiune corectă.");
           return;
         }
-
-        // după upsert primim id-urile (inclusiv pentru cele noi)
-        // reconstruim map-ul de drafts + lista inițială
-        const { data: fresh, error: freshErr } = await supabase
-          .from("options")
-          .select("id,question_id,text,value,order")
-          .eq("question_id", qid)
-          .order("order", { ascending: true });
-
-        if (freshErr) {
-          alert("Eroare la reîncărcarea opțiunilor: " + freshErr.message);
+      }
+      if (qtype === "multiple") {
+        const cnt = arr.filter((o) => o.correct).length;
+        if (cnt < 1) {
+          alert("La „multiple” trebuie cel puțin o opțiune corectă.");
           return;
         }
-
-        const drafts = (fresh ?? []).map(toDraft);
-        setOptDraftsByQ((m) => ({ ...m, [qid]: drafts }));
-        setInitialOptIdsByQ((m) => ({
-          ...m,
-          [qid]: (fresh ?? []).map((r) => r.id),
-        }));
-
-        // scoatem din initialIds tot ce încă există
-        for (const r of fresh ?? []) initialIds.delete(r.id);
       }
 
-      // 2) delete pentru ce nu mai există în UI (ce a rămas în initialIds)
-      const toDelete = Array.from(initialIds);
+      // 2) ștergem din DB ce a dispărut din UI (înainte de upsert)
+      const initialIds = new Set(initialOptIdsByQ[qid] ?? []);
+      const currentIds = new Set(
+        arr.map((d) => d.id).filter((id): id is string => Boolean(id))
+      );
+      const toDelete = Array.from(initialIds).filter(
+        (id) => !currentIds.has(id)
+      );
+
       if (toDelete.length) {
         const { error: delErr } = await supabase
           .from("options")
@@ -336,13 +406,43 @@ export default function QuizEditor({ quizId }: { quizId: string }) {
         }
       }
 
+      // 3) upsert pentru ce a rămas (insert/update)
+      const rows = arr.map((d) => toRow(qid, d));
+      const { error: upErr } = await supabase
+        .from("options")
+        .upsert(rows, { onConflict: "id" });
+      if (upErr) {
+        alert("Eroare la salvarea opțiunilor: " + upErr.message);
+        return;
+      }
+
+      // 4) re-încarcăm curentul din DB pentru id-urile noi și ordinea corectă
+      const { data: fresh, error: freshErr } = await supabase
+        .from("options")
+        .select("id,question_id,text,value,order")
+        .eq("question_id", qid)
+        .order("order", { ascending: true });
+
+      if (freshErr) {
+        alert("Eroare la reîncărcarea opțiunilor: " + freshErr.message);
+        return;
+      }
+
+      const draftsFresh = (fresh ?? []).map(toDraft);
+      setOptDraftsByQ((m) => ({ ...m, [qid]: draftsFresh }));
+      setInitialOptIdsByQ((m) => ({
+        ...m,
+        [qid]: (fresh ?? []).map((r) => r.id),
+      }));
+
       alert("Opțiuni salvate.");
     } finally {
       setSavingOpts(null);
     }
   }
 
-  // ====== RENDER ======
+  /* ========================= UI ========================== */
+
   if (loading) {
     return (
       <div className="p-6 text-sm text-gray-500">Se încarcă chestionarul…</div>
@@ -387,7 +487,7 @@ export default function QuizEditor({ quizId }: { quizId: string }) {
       <div className="space-y-2">
         {questions.length === 0 ? (
           <div className="text-sm text-gray-500">
-            Nu există întrebări. Folosește “+ Întrebare” ca să adaugi.
+            Nu există întrebări. Folosește “+ Întrebare”.
           </div>
         ) : (
           questions.map((q, i) => {
@@ -471,16 +571,24 @@ export default function QuizEditor({ quizId }: { quizId: string }) {
                         >
                           Salvează întrebarea
                         </button>
+
                         <button
                           onClick={() => setOpenId(null)}
                           className="px-3 py-2 rounded border"
                         >
                           Anulează
                         </button>
+
+                        <button
+                          onClick={() => deleteQuestion(q.id)}
+                          className="px-3 py-2 rounded border text-red-600 border-red-300 ml-auto"
+                        >
+                          Șterge întrebarea
+                        </button>
                       </div>
                     </div>
 
-                    {/* OPTIONS editor (single/multiple) */}
+                    {/* OPTIONS editor */}
                     {showOptions && (
                       <div className="mt-4">
                         <div className="font-medium mb-2">Opțiuni</div>
@@ -497,7 +605,7 @@ export default function QuizEditor({ quizId }: { quizId: string }) {
                               key={opt.id ?? `n-${idx}`}
                               className="grid gap-2 sm:grid-cols-12 items-end"
                             >
-                              <div className="sm:col-span-7">
+                              <div className="sm:col-span-6">
                                 <label className="block mb-1 text-xs text-gray-500">
                                   Text
                                 </label>
@@ -543,12 +651,28 @@ export default function QuizEditor({ quizId }: { quizId: string }) {
                                 </label>
                               </div>
 
-                              <div className="sm:col-span-1 mt-[22px]">
+                              {/* butoane ↑ ↓ × */}
+                              <div className="sm:col-span-2 mt-[22px] flex gap-1 justify-end">
                                 <button
-                                  className="px-2 py-1 border rounded w-full"
+                                  className="px-2 py-1 border rounded"
+                                  title="Mută sus"
+                                  onClick={() => moveOption(q.id, idx, -1)}
+                                >
+                                  ↑
+                                </button>
+                                <button
+                                  className="px-2 py-1 border rounded"
+                                  title="Mută jos"
+                                  onClick={() => moveOption(q.id, idx, 1)}
+                                >
+                                  ↓
+                                </button>
+                                <button
+                                  className="px-2 py-1 border rounded"
+                                  title="Șterge"
                                   onClick={() => removeOption(q.id, idx)}
                                 >
-                                  Șterge
+                                  ×
                                 </button>
                               </div>
                             </div>
