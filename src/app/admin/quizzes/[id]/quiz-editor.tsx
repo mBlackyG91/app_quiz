@@ -294,14 +294,19 @@ export default function QuizEditor({ quizId }: { quizId: string }) {
     }
 
     setQuestions((qs) => qs.filter((q) => q.id !== qid));
+
+    // curățăm map-urile fără a folosi variabile neutilizate
     setOptDraftsByQ((m) => {
-      const { [qid]: _, ...rest } = m;
-      return rest;
+      const next = { ...m };
+      delete next[qid];
+      return next;
     });
     setInitialOptIdsByQ((m) => {
-      const { [qid]: _, ...rest } = m;
-      return rest;
+      const next = { ...m };
+      delete next[qid];
+      return next;
     });
+
     if (openId === qid) setOpenId(null);
   }
 
@@ -356,12 +361,11 @@ export default function QuizEditor({ quizId }: { quizId: string }) {
     setSavingOpts(qid);
     try {
       const arrRaw = optDraftsByQ[qid] ?? [];
-
-      // 1) curăț: rânduri cu text gol => se consideră șterse în UI
+      // curăț: rânduri cu text gol dispar
       let arr = arrRaw.filter((o) => (o.text ?? "").trim().length > 0);
       arr = normalizeOrders(arr);
 
-      // reguli în funcție de tip
+      // reguli de bază în funcție de tip
       const currentQ = questions.find((x) => x.id === qid);
       const qtype = (drafts[qid]?.qtype ??
         currentQ?.qtype ??
@@ -386,27 +390,12 @@ export default function QuizEditor({ quizId }: { quizId: string }) {
         }
       }
 
-      // 2) ștergem din DB ce a dispărut din UI (înainte de upsert)
+      // set în UI ordinea normalizată
+      setOptDraftsByQ((m) => ({ ...m, [qid]: arr }));
+
       const initialIds = new Set(initialOptIdsByQ[qid] ?? []);
-      const currentIds = new Set(
-        arr.map((d) => d.id).filter((id): id is string => Boolean(id))
-      );
-      const toDelete = Array.from(initialIds).filter(
-        (id) => !currentIds.has(id)
-      );
 
-      if (toDelete.length) {
-        const { error: delErr } = await supabase
-          .from("options")
-          .delete()
-          .in("id", toDelete);
-        if (delErr) {
-          alert("Eroare la ștergerea opțiunilor: " + delErr.message);
-          return;
-        }
-      }
-
-      // 3) upsert pentru ce a rămas (insert/update)
+      // 1) upsert
       const rows = arr.map((d) => toRow(qid, d));
       const { error: upErr } = await supabase
         .from("options")
@@ -416,7 +405,7 @@ export default function QuizEditor({ quizId }: { quizId: string }) {
         return;
       }
 
-      // 4) re-încarcăm curentul din DB pentru id-urile noi și ordinea corectă
+      // 2) reîncărcare (ca să prindem id-urile nou create)
       const { data: fresh, error: freshErr } = await supabase
         .from("options")
         .select("id,question_id,text,value,order")
@@ -434,6 +423,20 @@ export default function QuizEditor({ quizId }: { quizId: string }) {
         ...m,
         [qid]: (fresh ?? []).map((r) => r.id),
       }));
+
+      // 3) șterge ce a dispărut din UI (ce a mai rămas în initialIds)
+      for (const r of fresh ?? []) initialIds.delete(r.id);
+      const toDelete = Array.from(initialIds);
+      if (toDelete.length) {
+        const { error: delErr } = await supabase
+          .from("options")
+          .delete()
+          .in("id", toDelete);
+        if (delErr) {
+          alert("Eroare la ștergerea opțiunilor: " + delErr.message);
+          return;
+        }
+      }
 
       alert("Opțiuni salvate.");
     } finally {
