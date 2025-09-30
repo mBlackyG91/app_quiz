@@ -262,7 +262,6 @@ export default function QuizEditor({ quizId }: { quizId: string }) {
       setQuestions((qs) =>
         [...qs, data].sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
       );
-      // init opțiuni pentru întrebarea nouă
       setOptDraftsByQ((m) => ({ ...m, [data.id]: [] }));
       setInitialOptIdsByQ((m) => ({ ...m, [data.id]: [] }));
       openEditor(data);
@@ -295,16 +294,16 @@ export default function QuizEditor({ quizId }: { quizId: string }) {
 
     setQuestions((qs) => qs.filter((q) => q.id !== qid));
 
-    // curățăm map-urile fără a folosi variabile neutilizate
+    // fără variabile aruncate => fără warning
     setOptDraftsByQ((m) => {
-      const next = { ...m };
-      delete next[qid];
-      return next;
+      const r = { ...m };
+      delete r[qid];
+      return r;
     });
     setInitialOptIdsByQ((m) => {
-      const next = { ...m };
-      delete next[qid];
-      return next;
+      const r = { ...m };
+      delete r[qid];
+      return r;
     });
 
     if (openId === qid) setOpenId(null);
@@ -349,9 +348,9 @@ export default function QuizEditor({ quizId }: { quizId: string }) {
       // swap by order + normalize
       const a = arr[idx];
       const b = arr[newIdx];
-      const tmp = a.order;
+      const tmp = a.order ?? 0;
       a.order = b.order ?? 0;
-      b.order = tmp ?? 0;
+      b.order = tmp;
 
       return { ...m, [qid]: normalizeOrders(arr) };
     });
@@ -361,7 +360,8 @@ export default function QuizEditor({ quizId }: { quizId: string }) {
     setSavingOpts(qid);
     try {
       const arrRaw = optDraftsByQ[qid] ?? [];
-      // curăț: rânduri cu text gol dispar
+
+      // curăț: fără rânduri complet goale
       let arr = arrRaw.filter((o) => (o.text ?? "").trim().length > 0);
       arr = normalizeOrders(arr);
 
@@ -375,70 +375,96 @@ export default function QuizEditor({ quizId }: { quizId: string }) {
         alert("Adaugă cel puțin o opțiune (cu text) înainte de salvare.");
         return;
       }
-      if (qtype === "single") {
-        const cnt = arr.filter((o) => o.correct).length;
-        if (cnt !== 1) {
-          alert("La „single” trebuie exact o opțiune corectă.");
-          return;
-        }
+      if (qtype === "single" && arr.filter((o) => o.correct).length !== 1) {
+        alert("La „single” trebuie exact o opțiune corectă.");
+        return;
       }
-      if (qtype === "multiple") {
-        const cnt = arr.filter((o) => o.correct).length;
-        if (cnt < 1) {
-          alert("La „multiple” trebuie cel puțin o opțiune corectă.");
-          return;
-        }
-      }
-
-      // set în UI ordinea normalizată
-      setOptDraftsByQ((m) => ({ ...m, [qid]: arr }));
-
-      const initialIds = new Set(initialOptIdsByQ[qid] ?? []);
-
-      // 1) upsert
-      const rows = arr.map((d) => toRow(qid, d));
-      const { error: upErr } = await supabase
-        .from("options")
-        .upsert(rows, { onConflict: "id" });
-      if (upErr) {
-        alert("Eroare la salvarea opțiunilor: " + upErr.message);
+      if (qtype === "multiple" && arr.filter((o) => o.correct).length < 1) {
+        alert("La „multiple” trebuie cel puțin o opțiune corectă.");
         return;
       }
 
-      // 2) reîncărcare (ca să prindem id-urile nou create)
-      const { data: fresh, error: freshErr } = await supabase
+      // set în UI ordinea normalizată (vizual)
+      setOptDraftsByQ((m) => ({ ...m, [qid]: arr }));
+
+      // pregătesc payloadul
+      const rows = arr.map((d) => toRow(qid, d));
+
+      // separ: cu id (upsert) / fără id (insert)
+      const withId = rows.filter((r) => "id" in r && r.id) as OptionRow[];
+      const withoutId = rows
+        .filter((r) => !("id" in r) || !r.id)
+        .map((r) => {
+          const { id, ...rest } = r; // elimin explicit id
+          return rest;
+        }) as Omit<OptionRow, "id">[];
+
+      if (withId.length) {
+        const { error: upErr } = await supabase
+          .from("options")
+          .upsert(withId, { onConflict: "id" })
+          .select("id"); // forțează răspuns JSON
+        if (upErr) {
+          console.error("[options/save] upsert error:", upErr);
+          alert("Eroare la salvarea opțiunilor: " + upErr.message);
+          return;
+        }
+      }
+
+      if (withoutId.length) {
+        const { error: insErr } = await supabase
+          .from("options")
+          .insert(withoutId)
+          .select("id");
+        if (insErr) {
+          console.error("[options/save] insert error:", insErr);
+          alert("Eroare la adăugarea opțiunilor: " + insErr.message);
+          return;
+        }
+      }
+
+      // reîncărcare (ca să prindem id-urile nou create)
+      const { data: fresh0, error: freshErr } = await supabase
         .from("options")
         .select("id,question_id,text,value,order")
         .eq("question_id", qid)
         .order("order", { ascending: true });
 
       if (freshErr) {
+        console.error("[options/save] reload error:", freshErr);
         alert("Eroare la reîncărcarea opțiunilor: " + freshErr.message);
         return;
       }
 
-      const draftsFresh = (fresh ?? []).map(toDraft);
-      setOptDraftsByQ((m) => ({ ...m, [qid]: draftsFresh }));
-      setInitialOptIdsByQ((m) => ({
-        ...m,
-        [qid]: (fresh ?? []).map((r) => r.id),
-      }));
+      // ce a dispărut din UI (inițial vs. ce e acum)
+      const idsAtStart = new Set(initialOptIdsByQ[qid] ?? []);
+      for (const r of fresh0 ?? []) idsAtStart.delete(r.id);
+      const toDelete = Array.from(idsAtStart);
 
-      // 3) șterge ce a dispărut din UI (ce a mai rămas în initialIds)
-      for (const r of fresh ?? []) initialIds.delete(r.id);
-      const toDelete = Array.from(initialIds);
       if (toDelete.length) {
         const { error: delErr } = await supabase
           .from("options")
           .delete()
           .in("id", toDelete);
         if (delErr) {
+          console.error("[options/save] delete error:", delErr);
           alert("Eroare la ștergerea opțiunilor: " + delErr.message);
           return;
         }
       }
 
+      // listă finală pentru UI (fără cele șterse)
+      const deletedSet = new Set(toDelete);
+      const fresh = (fresh0 ?? []).filter((r) => !deletedSet.has(r.id));
+
+      setOptDraftsByQ((m) => ({ ...m, [qid]: fresh.map(toDraft) }));
+      setInitialOptIdsByQ((m) => ({ ...m, [qid]: fresh.map((r) => r.id) }));
+
       alert("Opțiuni salvate.");
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error("[options/save] unexpected error:", e);
+      alert("Eroare la salvarea opțiunilor: " + msg);
     } finally {
       setSavingOpts(null);
     }

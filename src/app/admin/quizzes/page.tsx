@@ -2,34 +2,24 @@
 import Link from "next/link";
 import { createServer } from "@/lib/supabase-server";
 
-// model minim pentru listă
-type QuizRow = {
-  id: string;
-  title: string | null;
-  is_published: boolean;
-  created_at: string;
-};
+// tip pentru query-ul ?msg=
+type SP = Record<string, string | string[] | undefined>;
 
 export default async function AdminQuizzesPage({
   searchParams,
 }: {
-  searchParams?: { msg?: string | string[] };
+  searchParams: Promise<SP>; // <- în Next 15 vine ca Promise aici
 }) {
-  // citim eventualul mesaj (?msg=...)
-  const msg = Array.isArray(searchParams?.msg)
-    ? searchParams?.msg[0]
-    : searchParams?.msg;
+  // ✅ trebuie așteptat înainte de folosire
+  const sp = await searchParams;
+  const msg = Array.isArray(sp?.msg) ? sp.msg[0] : sp?.msg;
 
-  // IMPORTANT: client server-side
-  // (Dacă la tine `createServer()` *nu* e async, elimină `await`.)
   const supabase = await createServer();
 
-  const { data, error } = await supabase
+  const { data: quizzes, error } = await supabase
     .from("quizzes")
-    .select("id,title,is_published,created_at")
+    .select("id, title, is_published, created_at")
     .order("created_at", { ascending: false });
-
-  const quizzes: QuizRow[] = (data ?? []) as QuizRow[];
 
   return (
     <div className="p-4 max-w-4xl mx-auto">
@@ -44,59 +34,52 @@ export default async function AdminQuizzesPage({
         </Link>
       </div>
 
-      {/* mesaj (ex: redirect din editor când nu găsește quiz-ul) */}
-      {msg ? (
-        <div className="mb-4 rounded border border-yellow-300 bg-yellow-50 p-2 text-sm text-yellow-800">
+      {/* banner pentru mesaje din redirect (?msg=...) */}
+      {msg && (
+        <div className="mb-3 rounded border border-yellow-300 bg-yellow-50 text-yellow-800 px-3 py-2 text-sm">
           {msg}
         </div>
-      ) : null}
+      )}
 
-      {/* eroare încărcare din DB */}
       {error ? (
-        <div className="mb-4 rounded border border-red-300 bg-red-50 p-2 text-sm text-red-800">
-          Eroare la încărcarea chestionarelor: {error.message}
-        </div>
-      ) : null}
-
-      {quizzes.length === 0 ? (
-        <div className="text-sm text-gray-500">Nu există chestionare.</div>
+        <div className="text-red-600">Eroare la încărcarea listei.</div>
+      ) : (quizzes ?? []).length === 0 ? (
+        <div className="text-gray-500 text-sm">Nu există chestionare.</div>
       ) : (
-        <div className="space-y-2">
-          {quizzes.map((q) => (
-            <div
-              key={q.id}
-              className="rounded border px-3 py-2 flex items-center justify-between"
-            >
-              <div>
-                <div className="font-medium">{q.title || "(fără titlu)"}</div>
-                <div className="text-xs text-gray-500">
-                  {q.is_published ? "Public" : "Draft"}
-                </div>
-              </div>
-
-              <div className="flex gap-2">
-                <Link
-                  href={`/admin/quizzes/${q.id}`}
-                  className="px-2 py-1 rounded border"
-                >
-                  Editează
-                </Link>
-                <Link
-                  href={`/quizzes/${q.id}`}
-                  className="px-2 py-1 rounded border"
-                >
-                  Vezi
-                </Link>
-                <Link
-                  href={`/admin/quizzes/${q.id}/analytics`}
-                  className="px-2 py-1 rounded border"
-                >
-                  Analytics
-                </Link>
+        (quizzes ?? []).map((q) => (
+          <div
+            key={q.id}
+            className="rounded border px-3 py-2 flex items-center justify-between"
+          >
+            <div>
+              <div className="font-medium">{q.title || "(fără titlu)"}</div>
+              <div className="text-xs text-gray-500">
+                {q.is_published ? "Public" : "Draft"}
               </div>
             </div>
-          ))}
-        </div>
+
+            <div className="flex gap-2">
+              <Link
+                href={`/admin/quizzes/${q.id}`}
+                className="px-2 py-1 border rounded text-sm"
+              >
+                Editează
+              </Link>
+              <Link
+                href={`/quizzes/${q.id}`}
+                className="px-2 py-1 border rounded text-sm"
+              >
+                Vezi
+              </Link>
+              <Link
+                href={`/admin/quizzes/${q.id}/analytics`}
+                className="px-2 py-1 border rounded text-sm"
+              >
+                Analytics
+              </Link>
+            </div>
+          </div>
+        ))
       )}
     </div>
   );
