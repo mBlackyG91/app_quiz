@@ -108,7 +108,7 @@ export default function QuizEditor({ quizId }: { quizId: string }) {
         .from("quizzes")
         .select("id,title,description,is_published")
         .eq("id", quizId)
-        .maybeSingle();
+        .maybeSingle<Quiz>();
 
       if (!cancelled) {
         if (qErr) console.error("load quiz error:", qErr.message);
@@ -128,7 +128,7 @@ export default function QuizEditor({ quizId }: { quizId: string }) {
 
       if (!cancelled) {
         if (qsErr) console.error("load questions error:", qsErr.message);
-        const list = qs ?? [];
+        const list = (qs ?? []) as Question[];
         setQuestions(list);
 
         // Options
@@ -251,7 +251,7 @@ export default function QuizEditor({ quizId }: { quizId: string }) {
       .from("questions")
       .insert(insertRow)
       .select("id,quiz_id,label,qtype,required,order")
-      .maybeSingle();
+      .maybeSingle<Question>();
 
     if (error) {
       alert("Eroare la adăugare întrebare: " + error.message);
@@ -358,12 +358,7 @@ export default function QuizEditor({ quizId }: { quizId: string }) {
     });
   }
 
-  // type pentru payloadul de salvat
-  type RowForUpsert = Omit<OptionRow, "id"> & { id?: string };
-
-  // type guard curat: r are id valid
-  const hasId = (r: RowForUpsert): r is OptionRow =>
-    typeof r.id === "string" && r.id.length > 0;
+  /* ================== Save options (tipizat) ================= */
 
   async function saveOptionsForQuestion(qid: string) {
     setSavingOpts(qid);
@@ -400,7 +395,7 @@ export default function QuizEditor({ quizId }: { quizId: string }) {
       type RowForUpsert = Omit<OptionRow, "id"> & { id?: string };
       const rows: RowForUpsert[] = arr.map((d) => toRow(qid, d));
 
-      // split curat cu type guard (fără any)
+      // type guard curat, fără any
       const hasId = (r: RowForUpsert): r is OptionRow =>
         typeof r.id === "string" && r.id.length > 0;
 
@@ -409,7 +404,7 @@ export default function QuizEditor({ quizId }: { quizId: string }) {
         (r): r is Omit<OptionRow, "id"> => !hasId(r)
       );
 
-      // ⚠️ IMPORTANT: calculăm ce ștergem față de ce TRIMITEM acum, nu față de ce reîncărcăm
+      // ce a dispărut din UI (vs lista inițială)
       const initialIds = new Set(initialOptIdsByQ[qid] ?? []);
       const presentIdsNow = new Set(withId.map((r) => r.id));
       const toDelete = Array.from(initialIds).filter(
@@ -442,7 +437,7 @@ export default function QuizEditor({ quizId }: { quizId: string }) {
         }
       }
 
-      // 3) ștergem ce a dispărut din UI
+      // 3) ștergeri
       if (toDelete.length) {
         const { error: delErr } = await supabase
           .from("options")
@@ -455,7 +450,7 @@ export default function QuizEditor({ quizId }: { quizId: string }) {
         }
       }
 
-      // 4) reîncărcăm din DB ca să prindem id-urile nou create și starea finală
+      // 4) reload final
       const { data: fresh, error: freshErr } = await supabase
         .from("options")
         .select("id,question_id,text,value,order")
