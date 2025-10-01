@@ -1,3 +1,4 @@
+// src/app/admin/quizzes/[id]/analytics/page.tsx
 import { notFound } from "next/navigation";
 import Link from "next/link";
 import { createServer } from "@/lib/supabase-server";
@@ -8,6 +9,8 @@ import OptionPieChart, {
 } from "@/components/charts/OptionPieChart";
 
 /* ===================== Tipuri ===================== */
+
+type QType = "single" | "multiple" | "text" | "number";
 
 type Quiz = {
   id: string;
@@ -67,7 +70,7 @@ const STRUCTURES: { code: string; label: string }[] = [
   { code: "central", label: "Central" },
   { code: "srcf_bucuresti", label: "SRCF București" },
   { code: "srcf_craiova", label: "SRCF Craiova" },
-  { code: "srcf_timisora", label: "SRCF Timișoara" },
+  { code: "srcf_timisoara", label: "SRCF Timișoara" }, // << corect
   { code: "srcf_cluj", label: "SRCF Cluj" },
   { code: "srcf_brasov", label: "SRCF Brașov" },
   { code: "srcf_iasi", label: "SRCF Iași" },
@@ -80,6 +83,62 @@ function applyStructureFilter<
   T extends { eq: (col: string, val: string) => T }
 >(q: T, structure: string): T {
   return structure !== "all" ? q.eq("structure_code", structure) : q;
+}
+
+/* ====== helpers server-only ====== */
+
+function fmtNumber(v: number | null) {
+  return v == null ? "—" : Number(v).toLocaleString("ro-RO");
+}
+
+function groupBy<T>(arr: T[], keyFn: (x: T) => string) {
+  const m: Record<string, T[]> = {};
+  for (const x of arr) {
+    const k = keyFn(x);
+    (m[k] = m[k] ?? []).push(x);
+  }
+  return m;
+}
+
+/** normalizăm textul opțiunii ca să cumulăm “Da, sigur” cu “da, sigur ” etc. */
+function normLabel(s: string) {
+  return s.trim().toLocaleLowerCase("ro-RO");
+}
+
+/** agregă pe aceeași întrebare opțiunile cu același text */
+function aggregateOptions(rows: OptionCountRow[]) {
+  // total răspunsuri la întrebare
+  const total = rows.reduce((acc, r) => acc + (r.option_count ?? 0), 0);
+
+  // map după text normalizat
+  const byLabel = new Map<string, { label: string; count: number }>();
+  for (const r of rows) {
+    const display = r.option_text ?? "(fără text)";
+    const key = normLabel(display);
+    const prev = byLabel.get(key);
+    if (prev) {
+      prev.count += r.option_count ?? 0;
+    } else {
+      byLabel.set(key, { label: display, count: r.option_count ?? 0 });
+    }
+  }
+
+  // listă sortată descrescător
+  const items = Array.from(byLabel.values())
+    .sort((a, b) => b.count - a.count)
+    .map((x) => ({
+      option_text: x.label,
+      count: x.count,
+      pct: total > 0 ? Number(((x.count / total) * 100).toFixed(2)) : 0,
+    }));
+
+  // date pentru pie chart
+  const pie: PieDatum[] = items.map((i) => ({
+    name: i.option_text,
+    value: i.count,
+  }));
+
+  return { total, items, pie };
 }
 
 /* ===================== Pagina ===================== */
@@ -100,7 +159,9 @@ export default async function Page({ params, searchParams }: PageProps) {
     .eq("id", params.id)
     .maybeSingle<Quiz>();
 
-  if (quizErr) throw new Error("[analytics] load quiz: " + quizErr.message);
+  if (quizErr) {
+    throw new Error("[analytics] load quiz: " + quizErr.message);
+  }
   if (!quiz) notFound();
 
   // 2) Option counts (single/multiple)
@@ -115,7 +176,10 @@ export default async function Page({ params, searchParams }: PageProps) {
     q1Base,
     structure
   );
-  if (optErr) throw new Error("[analytics] option_counts: " + optErr.message);
+
+  if (optErr) {
+    throw new Error("[analytics] option_counts: " + optErr.message);
+  }
 
   // 3) Numeric stats
   const q2Base = supabase
@@ -143,11 +207,16 @@ export default async function Page({ params, searchParams }: PageProps) {
   );
   if (txtErr) throw new Error("[analytics] text_latest: " + txtErr.message);
 
-  // 5) Scores per submission (calc media pe server)
-  const { data: scores, error: sErr } = await supabase
+  // 5) Scores per submission — FILTRATE după structură (fix pentru rezumat)
+  const q4Base = supabase
     .from("analytics_quiz_scores")
     .select("quiz_id,structure_code,submission_id,score_pct")
     .eq("quiz_id", params.id);
+
+  const { data: scores, error: sErr } = await applyStructureFilter(
+    q4Base,
+    structure
+  );
   if (sErr) throw new Error("[analytics] quiz_scores: " + sErr.message);
 
   const scoreRows: ScoreRow[] = (scores ?? []) as ScoreRow[];
@@ -172,7 +241,7 @@ export default async function Page({ params, searchParams }: PageProps) {
     avg_score_pct,
   };
 
-  /* ====== Derivări pentru tabelul de opțiuni (percent) ====== */
+  /* ====== Agregări pentru opțiuni (cumulăm aceleași etichete) ====== */
   const optByQuestion = groupBy<OptionCountRow>(
     (optData ?? []) as OptionCountRow[],
     (r) => r.question_id
@@ -180,25 +249,7 @@ export default async function Page({ params, searchParams }: PageProps) {
 
   const optionTables = Object.entries(optByQuestion).map(([qid, rows]) => {
     const label = rows[0]?.question_label ?? "(fără titlu)";
-    const total = rows.reduce((acc, r) => acc + (r.option_count ?? 0), 0);
-    const items = rows
-      .slice()
-      .sort((a, b) => (b.option_count ?? 0) - (a.option_count ?? 0))
-      .map((r) => ({
-        option_text: r.option_text ?? "(fără text)",
-        count: r.option_count ?? 0,
-        pct:
-          total > 0
-            ? Number((((r.option_count ?? 0) / total) * 100).toFixed(2))
-            : 0,
-      }));
-
-    // date pentru pie chart
-    const pie: PieDatum[] = rows.map((r) => ({
-      name: r.option_text ?? "(fără text)",
-      value: r.option_count ?? 0,
-    }));
-
+    const { total, items, pie } = aggregateOptions(rows);
     return { question_id: qid, label, total, items, pie };
   });
 
@@ -216,10 +267,10 @@ export default async function Page({ params, searchParams }: PageProps) {
           </span>
         </h1>
         <Link
-          href={`/admin/quizzes/${quiz.id}`}
+          href={`/admin/quizzes/`}
           className="ml-auto text-sm text-blue-600 hover:underline"
         >
-          ← Înapoi la editor
+          ← Înapoi la chestionare
         </Link>
       </div>
 
@@ -263,14 +314,18 @@ export default async function Page({ params, searchParams }: PageProps) {
           <div className="space-y-6">
             {optionTables.map((q) => (
               <div key={q.question_id} className="border rounded">
-                <div className="px-3 py-2 border-b bg-gray-50 text-sm font-medium">
-                  {q.label}{" "}
-                  <span className="text-gray-500 font-normal">
-                    (n={q.total})
+                <div className="px-3 py-2 border-b bg-gray-50 text-sm font-medium flex items-center">
+                  <span>
+                    {q.label}{" "}
+                    <span className="text-gray-500 font-normal">
+                      (n={q.total})
+                    </span>
                   </span>
+                  {/* grafic la dreapta pe ecrane late */}
+                  <div className="ml-auto hidden xl:block w-56 h-40">
+                    <OptionPieChart data={q.pie} total={q.total} title=" " />
+                  </div>
                 </div>
-
-                {/* tabel */}
                 <div className="overflow-x-auto">
                   <table className="min-w-full text-sm">
                     <thead>
@@ -282,7 +337,10 @@ export default async function Page({ params, searchParams }: PageProps) {
                     </thead>
                     <tbody>
                       {q.items.map((it, idx) => (
-                        <tr key={idx} className="border-t">
+                        <tr
+                          key={`${q.question_id}:${idx}`}
+                          className="border-t"
+                        >
                           <td className="px-3 py-2">{it.option_text}</td>
                           <td className="px-3 py-2">{it.count}</td>
                           <td className="px-3 py-2">
@@ -294,14 +352,10 @@ export default async function Page({ params, searchParams }: PageProps) {
                   </table>
                 </div>
 
-                {/* pie chart */}
-                <div className="p-3 border-t xl:border-t-0 xl:border-l">
-                  <div className="h-64">
-                    <OptionPieChart
-                      data={q.pie}
-                      total={q.total}
-                      title="Distribuție răspunsuri"
-                    />
+                {/* grafic pe ecrane mici, sub tabel */}
+                <div className="xl:hidden p-3 border-t">
+                  <div className="h-56">
+                    <OptionPieChart data={q.pie} total={q.total} title=" " />
                   </div>
                 </div>
               </div>
@@ -328,8 +382,8 @@ export default async function Page({ params, searchParams }: PageProps) {
                 </tr>
               </thead>
               <tbody>
-                {(numData as NumericStatRow[]).map((r) => (
-                  <tr key={r.question_id} className="border-t">
+                {(numData as NumericStatRow[]).map((r, i) => (
+                  <tr key={`${r.question_id}:${i}`} className="border-t">
                     <td className="px-3 py-2">
                       {r.question_label ?? "(fără titlu)"}
                     </td>
@@ -352,9 +406,9 @@ export default async function Page({ params, searchParams }: PageProps) {
           <Empty notice="Nu există răspunsuri pentru întrebările de tip text." />
         ) : (
           <div className="space-y-3">
-            {(txtData as TextLatestRow[]).map((r) => (
+            {(txtData as TextLatestRow[]).map((r, i) => (
               <div
-                key={r.question_id}
+                key={`${r.question_id}:${r.created_at}:${i}`}
                 className="rounded border p-3 text-sm bg-white"
               >
                 <div className="text-gray-600 mb-1">
@@ -375,20 +429,7 @@ export default async function Page({ params, searchParams }: PageProps) {
   );
 }
 
-/* ===================== Auxiliare (server) ===================== */
-
-function fmtNumber(v: number | null) {
-  return v == null ? "—" : Number(v).toLocaleString("ro-RO");
-}
-
-function groupBy<T>(arr: T[], keyFn: (x: T) => string) {
-  const m: Record<string, T[]> = {};
-  for (const x of arr) {
-    const k = keyFn(x);
-    (m[k] = m[k] ?? []).push(x);
-  }
-  return m;
-}
+/* ===================== Componente auxiliare (server) ===================== */
 
 function Empty({ notice }: { notice: string }) {
   return (
@@ -398,6 +439,7 @@ function Empty({ notice }: { notice: string }) {
   );
 }
 
+/* Mică bară procentuală textuală (server-safe) */
 function BarCell({ pct }: { pct: number }) {
   const w = Math.max(0, Math.min(100, pct));
   return (
@@ -414,7 +456,7 @@ function BarCell({ pct }: { pct: number }) {
   );
 }
 
-/* Selector structuri */
+/* Selector structuri – schimbă query param-ul `structure` */
 function StructurePicker({
   quizId,
   active,
