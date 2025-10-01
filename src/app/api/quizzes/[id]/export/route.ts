@@ -1,4 +1,4 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { createServiceRole } from "@/lib/supabase-server";
 
 type AnswerRow = {
@@ -19,10 +19,15 @@ type AnswerRow = {
   };
 };
 
+// opțional, ca să eviți caching pe edge/CDN pentru export
+export const dynamic = "force-dynamic";
+
 export async function GET(
-  _req: Request,
-  { params }: { params: { id: string } }
+  _req: NextRequest,
+  context: { params: Promise<{ id: string }> } // 👈 Next 15.5 așteaptă Promise aici
 ) {
+  const { id } = await context.params; // 👈 extragem id-ul
+
   const supabase = await createServiceRole();
 
   const { data, error } = await supabase
@@ -38,8 +43,8 @@ export async function GET(
       questions!inner(label, qtype, "order")
     `
     )
-    .eq("submissions.quiz_id", params.id)
-    // ❗ corect: ordonează pe tabela embed-ată cu foreignTable
+    .eq("submissions.quiz_id", id)
+    // ordonare corectă pe tabelele înglobate
     .order("created_at", { ascending: true, foreignTable: "submissions" })
     .order("order", { ascending: true, foreignTable: "questions" });
 
@@ -90,10 +95,11 @@ export async function GET(
   }
 
   const csv = lines.join("\n");
+
   return new NextResponse(csv, {
     headers: {
       "Content-Type": "text/csv; charset=utf-8",
-      "Content-Disposition": `attachment; filename="quiz_${params.id}.csv"`,
+      "Content-Disposition": `attachment; filename="quiz_${id}.csv"`,
     },
   });
 }

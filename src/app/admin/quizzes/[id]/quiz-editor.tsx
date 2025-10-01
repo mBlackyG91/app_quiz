@@ -292,24 +292,26 @@ export default function QuizEditor({ quizId }: { quizId: string }) {
       return;
     }
 
+    // UI update (fără variabile aruncate)
     setQuestions((qs) => qs.filter((q) => q.id !== qid));
 
-    // fără variabile aruncate => fără warning
     setOptDraftsByQ((m) => {
-      const r = { ...m };
-      delete r[qid];
-      return r;
+      const copy = { ...m };
+      delete copy[qid];
+      return copy;
     });
+
     setInitialOptIdsByQ((m) => {
-      const r = { ...m };
-      delete r[qid];
-      return r;
+      const copy = { ...m };
+      delete copy[qid];
+      return copy;
     });
 
     if (openId === qid) setOpenId(null);
   }
 
   /* ==================== Options helpers =================== */
+
   const canHaveOptions = (qtype: QType) =>
     qtype === "single" || qtype === "multiple";
 
@@ -356,6 +358,13 @@ export default function QuizEditor({ quizId }: { quizId: string }) {
     });
   }
 
+  // type pentru payloadul de salvat
+  type RowForUpsert = Omit<OptionRow, "id"> & { id?: string };
+
+  // type guard curat: r are id valid
+  const hasId = (r: RowForUpsert): r is OptionRow =>
+    typeof r.id === "string" && r.id.length > 0;
+
   async function saveOptionsForQuestion(qid: string) {
     setSavingOpts(qid);
     try {
@@ -388,22 +397,31 @@ export default function QuizEditor({ quizId }: { quizId: string }) {
       setOptDraftsByQ((m) => ({ ...m, [qid]: arr }));
 
       // pregătesc payloadul
-      const rows = arr.map((d) => toRow(qid, d));
+      type RowForUpsert = Omit<OptionRow, "id"> & { id?: string };
+      const rows: RowForUpsert[] = arr.map((d) => toRow(qid, d));
 
-      // separ: cu id (upsert) / fără id (insert)
-      const withId = rows.filter((r) => "id" in r && r.id) as OptionRow[];
-      const withoutId = rows
-        .filter((r) => !("id" in r) || !r.id)
-        .map((r) => {
-          const { id, ...rest } = r; // elimin explicit id
-          return rest;
-        }) as Omit<OptionRow, "id">[];
+      // split curat cu type guard (fără any)
+      const hasId = (r: RowForUpsert): r is OptionRow =>
+        typeof r.id === "string" && r.id.length > 0;
 
+      const withId: OptionRow[] = rows.filter(hasId);
+      const withoutId: Omit<OptionRow, "id">[] = rows.filter(
+        (r): r is Omit<OptionRow, "id"> => !hasId(r)
+      );
+
+      // ⚠️ IMPORTANT: calculăm ce ștergem față de ce TRIMITEM acum, nu față de ce reîncărcăm
+      const initialIds = new Set(initialOptIdsByQ[qid] ?? []);
+      const presentIdsNow = new Set(withId.map((r) => r.id));
+      const toDelete = Array.from(initialIds).filter(
+        (id) => !presentIdsNow.has(id)
+      );
+
+      // 1) upsert la cele existente
       if (withId.length) {
         const { error: upErr } = await supabase
           .from("options")
           .upsert(withId, { onConflict: "id" })
-          .select("id"); // forțează răspuns JSON
+          .select("id");
         if (upErr) {
           console.error("[options/save] upsert error:", upErr);
           alert("Eroare la salvarea opțiunilor: " + upErr.message);
@@ -411,6 +429,7 @@ export default function QuizEditor({ quizId }: { quizId: string }) {
         }
       }
 
+      // 2) insert la cele noi
       if (withoutId.length) {
         const { error: insErr } = await supabase
           .from("options")
@@ -423,24 +442,7 @@ export default function QuizEditor({ quizId }: { quizId: string }) {
         }
       }
 
-      // reîncărcare (ca să prindem id-urile nou create)
-      const { data: fresh0, error: freshErr } = await supabase
-        .from("options")
-        .select("id,question_id,text,value,order")
-        .eq("question_id", qid)
-        .order("order", { ascending: true });
-
-      if (freshErr) {
-        console.error("[options/save] reload error:", freshErr);
-        alert("Eroare la reîncărcarea opțiunilor: " + freshErr.message);
-        return;
-      }
-
-      // ce a dispărut din UI (inițial vs. ce e acum)
-      const idsAtStart = new Set(initialOptIdsByQ[qid] ?? []);
-      for (const r of fresh0 ?? []) idsAtStart.delete(r.id);
-      const toDelete = Array.from(idsAtStart);
-
+      // 3) ștergem ce a dispărut din UI
       if (toDelete.length) {
         const { error: delErr } = await supabase
           .from("options")
@@ -453,12 +455,24 @@ export default function QuizEditor({ quizId }: { quizId: string }) {
         }
       }
 
-      // listă finală pentru UI (fără cele șterse)
-      const deletedSet = new Set(toDelete);
-      const fresh = (fresh0 ?? []).filter((r) => !deletedSet.has(r.id));
+      // 4) reîncărcăm din DB ca să prindem id-urile nou create și starea finală
+      const { data: fresh, error: freshErr } = await supabase
+        .from("options")
+        .select("id,question_id,text,value,order")
+        .eq("question_id", qid)
+        .order("order", { ascending: true });
 
-      setOptDraftsByQ((m) => ({ ...m, [qid]: fresh.map(toDraft) }));
-      setInitialOptIdsByQ((m) => ({ ...m, [qid]: fresh.map((r) => r.id) }));
+      if (freshErr) {
+        console.error("[options/save] reload error:", freshErr);
+        alert("Eroare la reîncărcarea opțiunilor: " + freshErr.message);
+        return;
+      }
+
+      setOptDraftsByQ((m) => ({ ...m, [qid]: (fresh ?? []).map(toDraft) }));
+      setInitialOptIdsByQ((m) => ({
+        ...m,
+        [qid]: (fresh ?? []).map((r) => r.id),
+      }));
 
       alert("Opțiuni salvate.");
     } catch (e: unknown) {
@@ -570,7 +584,9 @@ export default function QuizEditor({ quizId }: { quizId: string }) {
                           className="border rounded px-2 py-1 w-full"
                           value={localType}
                           onChange={(e) =>
-                            patchDraft(q.id, { qtype: e.target.value as QType })
+                            patchDraft(q.id, {
+                              qtype: e.target.value as QType,
+                            })
                           }
                         >
                           <option value="single">single</option>
