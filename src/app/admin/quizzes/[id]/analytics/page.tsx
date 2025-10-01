@@ -1,4 +1,3 @@
-// src/app/admin/quizzes/[id]/analytics/page.tsx
 import { notFound } from "next/navigation";
 import Link from "next/link";
 import { createServer } from "@/lib/supabase-server";
@@ -9,8 +8,6 @@ import OptionPieChart, {
 } from "@/components/charts/OptionPieChart";
 
 /* ===================== Tipuri ===================== */
-
-type QType = "single" | "multiple" | "text" | "number";
 
 type Quiz = {
   id: string;
@@ -63,6 +60,12 @@ export type ScoreSummary = {
   avg_score_pct: number | null;
 };
 
+type OptionRowSlim = {
+  id: string;
+  question_id: string;
+  value: string | null; // "1" dacă e corect
+};
+
 /* ====== Structuri (coduri & label pentru selector) ====== */
 
 const STRUCTURES: { code: string; label: string }[] = [
@@ -70,7 +73,7 @@ const STRUCTURES: { code: string; label: string }[] = [
   { code: "central", label: "Central" },
   { code: "srcf_bucuresti", label: "SRCF București" },
   { code: "srcf_craiova", label: "SRCF Craiova" },
-  { code: "srcf_timisoara", label: "SRCF Timișoara" }, // << corect
+  { code: "srcf_timisora", label: "SRCF Timișoara" },
   { code: "srcf_cluj", label: "SRCF Cluj" },
   { code: "srcf_brasov", label: "SRCF Brașov" },
   { code: "srcf_iasi", label: "SRCF Iași" },
@@ -83,62 +86,6 @@ function applyStructureFilter<
   T extends { eq: (col: string, val: string) => T }
 >(q: T, structure: string): T {
   return structure !== "all" ? q.eq("structure_code", structure) : q;
-}
-
-/* ====== helpers server-only ====== */
-
-function fmtNumber(v: number | null) {
-  return v == null ? "—" : Number(v).toLocaleString("ro-RO");
-}
-
-function groupBy<T>(arr: T[], keyFn: (x: T) => string) {
-  const m: Record<string, T[]> = {};
-  for (const x of arr) {
-    const k = keyFn(x);
-    (m[k] = m[k] ?? []).push(x);
-  }
-  return m;
-}
-
-/** normalizăm textul opțiunii ca să cumulăm “Da, sigur” cu “da, sigur ” etc. */
-function normLabel(s: string) {
-  return s.trim().toLocaleLowerCase("ro-RO");
-}
-
-/** agregă pe aceeași întrebare opțiunile cu același text */
-function aggregateOptions(rows: OptionCountRow[]) {
-  // total răspunsuri la întrebare
-  const total = rows.reduce((acc, r) => acc + (r.option_count ?? 0), 0);
-
-  // map după text normalizat
-  const byLabel = new Map<string, { label: string; count: number }>();
-  for (const r of rows) {
-    const display = r.option_text ?? "(fără text)";
-    const key = normLabel(display);
-    const prev = byLabel.get(key);
-    if (prev) {
-      prev.count += r.option_count ?? 0;
-    } else {
-      byLabel.set(key, { label: display, count: r.option_count ?? 0 });
-    }
-  }
-
-  // listă sortată descrescător
-  const items = Array.from(byLabel.values())
-    .sort((a, b) => b.count - a.count)
-    .map((x) => ({
-      option_text: x.label,
-      count: x.count,
-      pct: total > 0 ? Number(((x.count / total) * 100).toFixed(2)) : 0,
-    }));
-
-  // date pentru pie chart
-  const pie: PieDatum[] = items.map((i) => ({
-    name: i.option_text,
-    value: i.count,
-  }));
-
-  return { total, items, pie };
 }
 
 /* ===================== Pagina ===================== */
@@ -159,9 +106,7 @@ export default async function Page({ params, searchParams }: PageProps) {
     .eq("id", params.id)
     .maybeSingle<Quiz>();
 
-  if (quizErr) {
-    throw new Error("[analytics] load quiz: " + quizErr.message);
-  }
+  if (quizErr) throw new Error("[analytics] load quiz: " + quizErr.message);
   if (!quiz) notFound();
 
   // 2) Option counts (single/multiple)
@@ -176,9 +121,30 @@ export default async function Page({ params, searchParams }: PageProps) {
     q1Base,
     structure
   );
+  if (optErr) throw new Error("[analytics] option_counts: " + optErr.message);
+  const optionRows = (optData ?? []) as OptionCountRow[];
 
-  if (optErr) {
-    throw new Error("[analytics] option_counts: " + optErr.message);
+  // 2.1) Aduc opțiunile corecte pentru întrebările prezente (din tabela options) — fără `any`
+  const qids = Array.from(
+    new Set(optionRows.map((r) => r.question_id).filter(Boolean))
+  );
+  let correctIdsByQ: Record<string, Set<string>> = {};
+  if (qids.length) {
+    const { data: correctRows, error: corrErr } = await supabase
+      .from("options")
+      .select("id,question_id,value")
+      .in("question_id", qids)
+      .eq("value", "1")
+      .returns<OptionRowSlim[]>();
+
+    if (corrErr)
+      throw new Error("[analytics] load correct options: " + corrErr.message);
+
+    correctIdsByQ = {};
+    (correctRows ?? []).forEach((r) => {
+      const set = (correctIdsByQ[r.question_id] ||= new Set<string>());
+      if (r.value === "1") set.add(r.id);
+    });
   }
 
   // 3) Numeric stats
@@ -207,14 +173,14 @@ export default async function Page({ params, searchParams }: PageProps) {
   );
   if (txtErr) throw new Error("[analytics] text_latest: " + txtErr.message);
 
-  // 5) Scores per submission — FILTRATE după structură (fix pentru rezumat)
-  const q4Base = supabase
+  // 5) Scores per submission — AICI era problema: filtrăm și pe structură
+  const sBase = supabase
     .from("analytics_quiz_scores")
     .select("quiz_id,structure_code,submission_id,score_pct")
     .eq("quiz_id", params.id);
 
   const { data: scores, error: sErr } = await applyStructureFilter(
-    q4Base,
+    sBase,
     structure
   );
   if (sErr) throw new Error("[analytics] quiz_scores: " + sErr.message);
@@ -241,17 +207,61 @@ export default async function Page({ params, searchParams }: PageProps) {
     avg_score_pct,
   };
 
-  /* ====== Agregări pentru opțiuni (cumulăm aceleași etichete) ====== */
+  /* ====== Agregare/derivări (percent + marcaj corect + dedup pe text) ====== */
+
+  // normalizare text (reduce dublurile „VarIanta A”, „ Varianta  A ” etc.)
+  const normalizeText = (s: string) =>
+    s.normalize("NFC").trim().replace(/\s+/g, " ").toLowerCase();
+
   const optByQuestion = groupBy<OptionCountRow>(
-    (optData ?? []) as OptionCountRow[],
+    optionRows,
     (r) => r.question_id
   );
 
-  const optionTables = Object.entries(optByQuestion).map(([qid, rows]) => {
-    const label = rows[0]?.question_label ?? "(fără titlu)";
-    const { total, items, pie } = aggregateOptions(rows);
-    return { question_id: qid, label, total, items, pie };
-  });
+  const optionTables = Object.entries(optByQuestion)
+    .map(([qid, rows]) => {
+      const label = rows[0]?.question_label ?? "(fără titlu)";
+      const total = rows.reduce((acc, r) => acc + (r.option_count ?? 0), 0);
+
+      const correctSet = correctIdsByQ[qid] ?? new Set<string>();
+
+      // grupăm pe text NORMALIZAT, dar păstrăm prima formă „frumoasă” pentru afișare
+      const grouped = new Map<
+        string,
+        { pretty: string; rows: OptionCountRow[] }
+      >();
+      for (const r of rows) {
+        const pretty = (r.option_text ?? "").trim() || "(fără text)";
+        const key = normalizeText(pretty);
+        const pack = grouped.get(key) ?? { pretty, rows: [] };
+        pack.rows.push(r);
+        if (!grouped.has(key)) grouped.set(key, pack);
+      }
+
+      const items = Array.from(grouped.values())
+        .map(({ pretty, rows: arr }) => {
+          const count = arr.reduce((a, b) => a + (b.option_count ?? 0), 0);
+          const pct =
+            total > 0 ? Number(((count / total) * 100).toFixed(2)) : 0;
+          const isCorrect = arr.some(
+            (r) => r.option_id && correctSet.has(r.option_id)
+          );
+          return { option_text: pretty, count, pct, isCorrect };
+        })
+        .sort((a, b) => b.count - a.count);
+
+      const pie: PieDatum[] = items.map((it) => ({
+        name: it.option_text + (it.isCorrect ? " (corect)" : ""),
+        value: it.count,
+      }));
+
+      return { question_id: qid, label, total, items, pie };
+    })
+    .sort(
+      (a, b) =>
+        indexFromLabel(a.label) - indexFromLabel(b.label) ||
+        a.label.localeCompare(b.label)
+    );
 
   /* ===================== Render ===================== */
 
@@ -267,7 +277,7 @@ export default async function Page({ params, searchParams }: PageProps) {
           </span>
         </h1>
         <Link
-          href={`/admin/quizzes/`}
+          href={`/admin/quizzes/}`}
           className="ml-auto text-sm text-blue-600 hover:underline"
         >
           ← Înapoi la chestionare
@@ -281,27 +291,22 @@ export default async function Page({ params, searchParams }: PageProps) {
       <section className="border rounded-md p-4">
         <h2 className="font-medium mb-3">Rezumat scor</h2>
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-sm">
-          <div className="rounded border p-3">
-            <div className="text-gray-500">Submisii</div>
-            <div className="text-lg font-semibold">
-              {summary.submissions_count}
-            </div>
-          </div>
-          <div className="rounded border p-3">
-            <div className="text-gray-500">Media scor (%)</div>
-            <div className="text-lg font-semibold">
-              {summary.avg_score_pct != null ? `${summary.avg_score_pct}` : "—"}
-            </div>
-          </div>
-          <div className="rounded border p-3">
-            <div className="text-gray-500">Structură</div>
-            <div className="text-lg font-semibold">
-              {structure === "all"
+          <StatBox label="Submisii" value={summary.submissions_count} />
+          <StatBox
+            label="Media scor (%)"
+            value={
+              summary.avg_score_pct != null ? `${summary.avg_score_pct}` : "—"
+            }
+          />
+          <StatBox
+            label="Structură"
+            value={
+              structure === "all"
                 ? "Toate"
                 : STRUCTURES.find((s) => s.code === structure)?.label ??
-                  structure}
-            </div>
-          </div>
+                  structure
+            }
+          />
         </div>
       </section>
 
@@ -313,49 +318,63 @@ export default async function Page({ params, searchParams }: PageProps) {
         ) : (
           <div className="space-y-6">
             {optionTables.map((q) => (
-              <div key={q.question_id} className="border rounded">
-                <div className="px-3 py-2 border-b bg-gray-50 text-sm font-medium flex items-center">
-                  <span>
-                    {q.label}{" "}
-                    <span className="text-gray-500 font-normal">
-                      (n={q.total})
-                    </span>
+              <div
+                key={q.question_id}
+                className="border rounded overflow-hidden"
+              >
+                <div className="px-3 py-2 border-b bg-gray-50 text-sm font-medium">
+                  {q.label}{" "}
+                  <span className="text-gray-500 font-normal">
+                    (n={q.total})
                   </span>
-                  {/* grafic la dreapta pe ecrane late */}
-                  <div className="ml-auto hidden xl:block w-56 h-40">
-                    <OptionPieChart data={q.pie} total={q.total} title=" " />
-                  </div>
-                </div>
-                <div className="overflow-x-auto">
-                  <table className="min-w-full text-sm">
-                    <thead>
-                      <tr className="text-left bg-gray-50">
-                        <th className="px-3 py-2 w-2/3">Opțiune</th>
-                        <th className="px-3 py-2">Răspunsuri</th>
-                        <th className="px-3 py-2">Procent</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {q.items.map((it, idx) => (
-                        <tr
-                          key={`${q.question_id}:${idx}`}
-                          className="border-t"
-                        >
-                          <td className="px-3 py-2">{it.option_text}</td>
-                          <td className="px-3 py-2">{it.count}</td>
-                          <td className="px-3 py-2">
-                            <BarCell pct={it.pct} />
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
                 </div>
 
-                {/* grafic pe ecrane mici, sub tabel */}
-                <div className="xl:hidden p-3 border-t">
-                  <div className="h-56">
-                    <OptionPieChart data={q.pie} total={q.total} title=" " />
+                <div className="flex flex-col xl:flex-row gap-0 xl:gap-3">
+                  {/* tabel */}
+                  <div className="overflow-x-auto flex-1">
+                    <table className="min-w-full text-sm">
+                      <thead>
+                        <tr className="text-left bg-gray-50">
+                          <th className="px-3 py-2 w-2/3">Opțiune</th>
+                          <th className="px-3 py-2">Răspunsuri</th>
+                          <th className="px-3 py-2">Procent</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {q.items.map((it, idx) => (
+                          <tr
+                            key={`${it.option_text}-${idx}`}
+                            className="border-t"
+                          >
+                            <td className="px-3 py-2">
+                              <div className="flex items-center gap-2 flex-wrap">
+                                <span>{it.option_text}</span>
+                                {it.isCorrect && (
+                                  <span className="text-xs px-2 py-0.5 rounded border border-emerald-300 bg-emerald-50 text-emerald-700">
+                                    ✓ corect
+                                  </span>
+                                )}
+                              </div>
+                            </td>
+                            <td className="px-3 py-2">{it.count}</td>
+                            <td className="px-3 py-2">
+                              <BarCell pct={it.pct} highlight={it.isCorrect} />
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+
+                  {/* pie chart */}
+                  <div className="hidden xl:block shrink-0 w-[360px] border-l">
+                    <div className="p-3 min-h-[16rem]">
+                      <OptionPieChart
+                        data={q.pie}
+                        total={q.total}
+                        title="Distribuție răspunsuri"
+                      />
+                    </div>
                   </div>
                 </div>
               </div>
@@ -382,17 +401,28 @@ export default async function Page({ params, searchParams }: PageProps) {
                 </tr>
               </thead>
               <tbody>
-                {(numData as NumericStatRow[]).map((r, i) => (
-                  <tr key={`${r.question_id}:${i}`} className="border-t">
-                    <td className="px-3 py-2">
-                      {r.question_label ?? "(fără titlu)"}
-                    </td>
-                    <td className="px-3 py-2">{r.n}</td>
-                    <td className="px-3 py-2">{fmtNumber(r.avg)}</td>
-                    <td className="px-3 py-2">{fmtNumber(r.min)}</td>
-                    <td className="px-3 py-2">{fmtNumber(r.max)}</td>
-                  </tr>
-                ))}
+                {(numData as NumericStatRow[])
+                  .slice()
+                  .sort(
+                    (a, b) =>
+                      indexFromLabel(a.question_label ?? "") -
+                        indexFromLabel(b.question_label ?? "") ||
+                      (a.question_label ?? "").localeCompare(
+                        b.question_label ?? "",
+                        "ro"
+                      )
+                  )
+                  .map((r) => (
+                    <tr key={r.question_id} className="border-t">
+                      <td className="px-3 py-2">
+                        {r.question_label ?? "(fără titlu)"}
+                      </td>
+                      <td className="px-3 py-2">{r.n}</td>
+                      <td className="px-3 py-2">{fmtNumber(r.avg)}</td>
+                      <td className="px-3 py-2">{fmtNumber(r.min)}</td>
+                      <td className="px-3 py-2">{fmtNumber(r.max)}</td>
+                    </tr>
+                  ))}
               </tbody>
             </table>
           </div>
@@ -406,22 +436,33 @@ export default async function Page({ params, searchParams }: PageProps) {
           <Empty notice="Nu există răspunsuri pentru întrebările de tip text." />
         ) : (
           <div className="space-y-3">
-            {(txtData as TextLatestRow[]).map((r, i) => (
-              <div
-                key={`${r.question_id}:${r.created_at}:${i}`}
-                className="rounded border p-3 text-sm bg-white"
-              >
-                <div className="text-gray-600 mb-1">
-                  {r.question_label ?? "(fără titlu)"}
+            {(txtData as TextLatestRow[])
+              .slice()
+              .sort(
+                (a, b) =>
+                  indexFromLabel(a.question_label ?? "") -
+                    indexFromLabel(b.question_label ?? "") ||
+                  (a.question_label ?? "").localeCompare(
+                    b.question_label ?? "",
+                    "ro"
+                  )
+              )
+              .map((r) => (
+                <div
+                  key={r.question_id}
+                  className="rounded border p-3 text-sm bg-white"
+                >
+                  <div className="text-gray-600 mb-1">
+                    {r.question_label ?? "(fără titlu)"}
+                  </div>
+                  <div className="font-medium">
+                    {r.value_text ?? <em className="text-gray-400">(gol)</em>}
+                  </div>
+                  <div className="text-xs text-gray-400 mt-1">
+                    {new Date(r.created_at).toLocaleString("ro-RO")}
+                  </div>
                 </div>
-                <div className="font-medium">
-                  {r.value_text ?? <em className="text-gray-400">(gol)</em>}
-                </div>
-                <div className="text-xs text-gray-400 mt-1">
-                  {new Date(r.created_at).toLocaleString()}
-                </div>
-              </div>
-            ))}
+              ))}
           </div>
         )}
       </section>
@@ -429,7 +470,25 @@ export default async function Page({ params, searchParams }: PageProps) {
   );
 }
 
-/* ===================== Componente auxiliare (server) ===================== */
+/* ===================== Helpers & UI (server) ===================== */
+
+function fmtNumber(v: number | null) {
+  return v == null ? "—" : Number(v).toLocaleString("ro-RO");
+}
+
+function groupBy<T>(arr: T[], keyFn: (x: T) => string) {
+  const m: Record<string, T[]> = {};
+  for (const x of arr) {
+    const k = keyFn(x);
+    (m[k] = m[k] ?? []).push(x);
+  }
+  return m;
+}
+
+function indexFromLabel(label: string) {
+  const m = label.match(/(\d+)/);
+  return m ? parseInt(m[1], 10) : Number.MAX_SAFE_INTEGER;
+}
 
 function Empty({ notice }: { notice: string }) {
   return (
@@ -439,14 +498,24 @@ function Empty({ notice }: { notice: string }) {
   );
 }
 
-/* Mică bară procentuală textuală (server-safe) */
-function BarCell({ pct }: { pct: number }) {
+function StatBox({ label, value }: { label: string; value: string | number }) {
+  return (
+    <div className="rounded border p-3">
+      <div className="text-gray-500">{label}</div>
+      <div className="text-lg font-semibold">{value}</div>
+    </div>
+  );
+}
+
+/* Bară procentuală – evidențiem „corect” cu o culoare mai puternică */
+function BarCell({ pct, highlight }: { pct: number; highlight?: boolean }) {
   const w = Math.max(0, Math.min(100, pct));
+  const barClass = highlight ? "bg-emerald-600" : "bg-slate-400";
   return (
     <div className="flex items-center gap-2">
       <div className="h-2 w-32 bg-gray-200 rounded overflow-hidden">
         <div
-          className="h-2 bg-emerald-500"
+          className={`h-2 ${barClass}`}
           style={{ width: `${w}%` }}
           aria-hidden
         />
