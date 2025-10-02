@@ -1,3 +1,4 @@
+// src/app/admin/quizzes/[id]/analytics/page.tsx
 import { notFound } from "next/navigation";
 import Link from "next/link";
 import { createServer } from "@/lib/supabase-server";
@@ -60,12 +61,6 @@ export type ScoreSummary = {
   avg_score_pct: number | null;
 };
 
-type OptionRowSlim = {
-  id: string;
-  question_id: string;
-  value: string | null; // "1" dacă e corect
-};
-
 /* ====== Structuri (coduri & label pentru selector) ====== */
 
 const STRUCTURES: { code: string; label: string }[] = [
@@ -96,14 +91,18 @@ type PageProps = {
 };
 
 export default async function Page({ params, searchParams }: PageProps) {
+  // Evită warning-ul Next "sync dynamic APIs"
+  const _params = await Promise.resolve(params);
+  const _searchParams = await Promise.resolve(searchParams ?? {});
   const supabase = await createServer();
-  const structure = (searchParams?.structure ?? "all").toLowerCase();
+
+  const structure = (_searchParams.structure ?? "all").toLowerCase();
 
   // 1) Load quiz
   const { data: quiz, error: quizErr } = await supabase
     .from("quizzes")
     .select("id,title,is_published")
-    .eq("id", params.id)
+    .eq("id", _params.id)
     .maybeSingle<Quiz>();
 
   if (quizErr) throw new Error("[analytics] load quiz: " + quizErr.message);
@@ -115,16 +114,17 @@ export default async function Page({ params, searchParams }: PageProps) {
     .select(
       "quiz_id,structure_code,question_id,question_label,option_id,option_text,option_count"
     )
-    .eq("quiz_id", params.id);
+    .eq("quiz_id", _params.id);
 
   const { data: optData, error: optErr } = await applyStructureFilter(
     q1Base,
     structure
   );
   if (optErr) throw new Error("[analytics] option_counts: " + optErr.message);
+
   const optionRows = (optData ?? []) as OptionCountRow[];
 
-  // 2.1) Aduc opțiunile corecte pentru întrebările prezente (din tabela options) — fără `any`
+  // 2.1) Aduc opțiunile corecte pentru întrebările prezente (din tabela options)
   const qids = Array.from(
     new Set(optionRows.map((r) => r.question_id).filter(Boolean))
   );
@@ -134,24 +134,24 @@ export default async function Page({ params, searchParams }: PageProps) {
       .from("options")
       .select("id,question_id,value")
       .in("question_id", qids)
-      .eq("value", "1")
-      .returns<OptionRowSlim[]>();
+      .eq("value", "1");
 
     if (corrErr)
       throw new Error("[analytics] load correct options: " + corrErr.message);
 
-    correctIdsByQ = {};
-    (correctRows ?? []).forEach((r) => {
-      const set = (correctIdsByQ[r.question_id] ||= new Set<string>());
+    correctIdsByQ = (correctRows ?? []).reduce((acc, r) => {
+      const set = acc[r.question_id] ?? new Set<string>();
       if (r.value === "1") set.add(r.id);
-    });
+      acc[r.question_id] = set;
+      return acc;
+    }, {} as Record<string, Set<string>>);
   }
 
   // 3) Numeric stats
   const q2Base = supabase
     .from("analytics_numeric_stats")
     .select("quiz_id,structure_code,question_id,question_label,n,avg,min,max")
-    .eq("quiz_id", params.id);
+    .eq("quiz_id", _params.id);
 
   const { data: numData, error: numErr } = await applyStructureFilter(
     q2Base,
@@ -165,7 +165,7 @@ export default async function Page({ params, searchParams }: PageProps) {
     .select(
       "quiz_id,structure_code,question_id,question_label,value_text,created_at"
     )
-    .eq("quiz_id", params.id);
+    .eq("quiz_id", _params.id);
 
   const { data: txtData, error: txtErr } = await applyStructureFilter(
     q3Base,
@@ -173,11 +173,11 @@ export default async function Page({ params, searchParams }: PageProps) {
   );
   if (txtErr) throw new Error("[analytics] text_latest: " + txtErr.message);
 
-  // 5) Scores per submission — AICI era problema: filtrăm și pe structură
+  // 5) Scores per submission
   const sBase = supabase
     .from("analytics_quiz_scores")
     .select("quiz_id,structure_code,submission_id,score_pct")
-    .eq("quiz_id", params.id);
+    .eq("quiz_id", _params.id);
 
   const { data: scores, error: sErr } = await applyStructureFilter(
     sBase,
@@ -201,18 +201,13 @@ export default async function Page({ params, searchParams }: PageProps) {
       : null;
 
   const summary: ScoreSummary = {
-    quiz_id: params.id,
+    quiz_id: _params.id,
     structure_code: structure === "all" ? null : structure,
     submissions_count,
     avg_score_pct,
   };
 
-  /* ====== Agregare/derivări (percent + marcaj corect + dedup pe text) ====== */
-
-  // normalizare text (reduce dublurile „VarIanta A”, „ Varianta  A ” etc.)
-  const normalizeText = (s: string) =>
-    s.normalize("NFC").trim().replace(/\s+/g, " ").toLowerCase();
-
+  /* ====== Derivări pentru tabelul de opțiuni (percent + marcaj corect) ====== */
   const optByQuestion = groupBy<OptionCountRow>(
     optionRows,
     (r) => r.question_id
@@ -223,35 +218,30 @@ export default async function Page({ params, searchParams }: PageProps) {
       const label = rows[0]?.question_label ?? "(fără titlu)";
       const total = rows.reduce((acc, r) => acc + (r.option_count ?? 0), 0);
 
+      // grupăm după text, dar marcăm „corect” dacă oricare din opțiunile cu același text
+      // are id care apare în setul de corecte pentru întrebare
+      const grouped = groupBy(rows, (r) => (r.option_text ?? "").trim());
       const correctSet = correctIdsByQ[qid] ?? new Set<string>();
 
-      // grupăm pe text NORMALIZAT, dar păstrăm prima formă „frumoasă” pentru afișare
-      const grouped = new Map<
-        string,
-        { pretty: string; rows: OptionCountRow[] }
-      >();
-      for (const r of rows) {
-        const pretty = (r.option_text ?? "").trim() || "(fără text)";
-        const key = normalizeText(pretty);
-        const pack = grouped.get(key) ?? { pretty, rows: [] };
-        pack.rows.push(r);
-        if (!grouped.has(key)) grouped.set(key, pack);
-      }
-
-      const items = Array.from(grouped.values())
-        .map(({ pretty, rows: arr }) => {
+      const items = Object.entries(grouped)
+        .map(([text, arr]) => {
           const count = arr.reduce((a, b) => a + (b.option_count ?? 0), 0);
           const pct =
             total > 0 ? Number(((count / total) * 100).toFixed(2)) : 0;
           const isCorrect = arr.some(
             (r) => r.option_id && correctSet.has(r.option_id)
           );
-          return { option_text: pretty, count, pct, isCorrect };
+          return {
+            option_text: text || "(fără text)",
+            count,
+            pct,
+            isCorrect,
+          };
         })
         .sort((a, b) => b.count - a.count);
 
       const pie: PieDatum[] = items.map((it) => ({
-        name: it.option_text + (it.isCorrect ? " (corect)" : ""),
+        name: it.option_text,
         value: it.count,
       }));
 
@@ -277,7 +267,7 @@ export default async function Page({ params, searchParams }: PageProps) {
           </span>
         </h1>
         <Link
-          href={`/admin/quizzes/}`}
+          href={`/admin/quizzes`}
           className="ml-auto text-sm text-blue-600 hover:underline"
         >
           ← Înapoi la chestionare
@@ -351,7 +341,7 @@ export default async function Page({ params, searchParams }: PageProps) {
                                 <span>{it.option_text}</span>
                                 {it.isCorrect && (
                                   <span className="text-xs px-2 py-0.5 rounded border border-emerald-300 bg-emerald-50 text-emerald-700">
-                                    ✓ corect
+                                    corect
                                   </span>
                                 )}
                               </div>
@@ -383,7 +373,7 @@ export default async function Page({ params, searchParams }: PageProps) {
         )}
       </section>
 
-      {/* Numeric stats */}
+      {/* Întrebări numerice */}
       <section className="border rounded-md p-4">
         <h2 className="font-medium mb-3">Întrebări numerice</h2>
         {(numData ?? []).length === 0 ? (
@@ -408,28 +398,44 @@ export default async function Page({ params, searchParams }: PageProps) {
                       indexFromLabel(a.question_label ?? "") -
                         indexFromLabel(b.question_label ?? "") ||
                       (a.question_label ?? "").localeCompare(
-                        b.question_label ?? "",
-                        "ro"
+                        b.question_label ?? ""
                       )
                   )
-                  .map((r) => (
-                    <tr key={r.question_id} className="border-t">
-                      <td className="px-3 py-2">
-                        {r.question_label ?? "(fără titlu)"}
-                      </td>
-                      <td className="px-3 py-2">{r.n}</td>
-                      <td className="px-3 py-2">{fmtNumber(r.avg)}</td>
-                      <td className="px-3 py-2">{fmtNumber(r.min)}</td>
-                      <td className="px-3 py-2">{fmtNumber(r.max)}</td>
-                    </tr>
-                  ))}
+                  .map((r, i) => {
+                    // *** Cheie compusă pentru unicititate ***
+                    const sk = r.structure_code ?? "all";
+                    const key = `${r.question_id}-${sk}-${i}`;
+                    const structLabel =
+                      sk === "all"
+                        ? null
+                        : STRUCTURES.find((s) => s.code === sk)?.label ?? sk;
+
+                    return (
+                      <tr key={key} className="border-t">
+                        <td className="px-3 py-2">
+                          <div className="flex items-center gap-2">
+                            <span>{r.question_label ?? "(fără titlu)"}</span>
+                            {structure === "all" && structLabel && (
+                              <span className="text-[11px] px-1.5 py-0.5 rounded bg-gray-100 text-gray-600 border">
+                                {structLabel}
+                              </span>
+                            )}
+                          </div>
+                        </td>
+                        <td className="px-3 py-2">{r.n}</td>
+                        <td className="px-3 py-2">{fmtNumber(r.avg)}</td>
+                        <td className="px-3 py-2">{fmtNumber(r.min)}</td>
+                        <td className="px-3 py-2">{fmtNumber(r.max)}</td>
+                      </tr>
+                    );
+                  })}
               </tbody>
             </table>
           </div>
         )}
       </section>
 
-      {/* Latest text */}
+      {/* Răspunsuri text */}
       <section className="border rounded-md p-4">
         <h2 className="font-medium mb-3">Răspunsuri text (cele mai recente)</h2>
         {(txtData ?? []).length === 0 ? (
@@ -442,27 +448,39 @@ export default async function Page({ params, searchParams }: PageProps) {
                 (a, b) =>
                   indexFromLabel(a.question_label ?? "") -
                     indexFromLabel(b.question_label ?? "") ||
-                  (a.question_label ?? "").localeCompare(
-                    b.question_label ?? "",
-                    "ro"
-                  )
+                  (a.question_label ?? "").localeCompare(b.question_label ?? "")
               )
-              .map((r) => (
-                <div
-                  key={r.question_id}
-                  className="rounded border p-3 text-sm bg-white"
-                >
-                  <div className="text-gray-600 mb-1">
-                    {r.question_label ?? "(fără titlu)"}
+              .map((r, i) => {
+                // *** Cheie compusă pentru unicititate ***
+                const sk = r.structure_code ?? "all";
+                const key = `${r.question_id}-${sk}-${i}`;
+                const structLabel =
+                  sk === "all"
+                    ? null
+                    : STRUCTURES.find((s) => s.code === sk)?.label ?? sk;
+
+                return (
+                  <div
+                    key={key}
+                    className="rounded border p-3 text-sm bg-white"
+                  >
+                    <div className="text-gray-600 mb-1 flex items-center gap-2">
+                      <span>{r.question_label ?? "(fără titlu)"} </span>
+                      {structure === "all" && structLabel && (
+                        <span className="text-[11px] px-1.5 py-0.5 rounded bg-gray-100 text-gray-600 border">
+                          {structLabel}
+                        </span>
+                      )}
+                    </div>
+                    <div className="font-medium">
+                      {r.value_text ?? <em className="text-gray-400">(gol)</em>}
+                    </div>
+                    <div className="text-xs text-gray-400 mt-1">
+                      {new Date(r.created_at).toLocaleString()}
+                    </div>
                   </div>
-                  <div className="font-medium">
-                    {r.value_text ?? <em className="text-gray-400">(gol)</em>}
-                  </div>
-                  <div className="text-xs text-gray-400 mt-1">
-                    {new Date(r.created_at).toLocaleString("ro-RO")}
-                  </div>
-                </div>
-              ))}
+                );
+              })}
           </div>
         )}
       </section>
@@ -470,7 +488,7 @@ export default async function Page({ params, searchParams }: PageProps) {
   );
 }
 
-/* ===================== Helpers & UI (server) ===================== */
+/* ===================== Componente auxiliare (server) ===================== */
 
 function fmtNumber(v: number | null) {
   return v == null ? "—" : Number(v).toLocaleString("ro-RO");
